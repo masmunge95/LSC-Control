@@ -29,6 +29,7 @@ dist-ssr
 android/app/build/
 android/.gradle/
 generate-splash.ps1
+generate-icons.ps1
 
 # Android SDK & Local Config (NEVER COMMIT)
 android/local.properties

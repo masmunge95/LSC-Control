@@ -231,6 +231,23 @@ export class BleManager {
     return { device: { id: device.id, name: device.name }, detectedProtocol };
   }
 
+    /**
+   * Synchronizes the hardware controller's internal RTC clock with local device time.
+   */
+  public async syncControllerTime(device: DeviceRecord, date: Date = new Date()): Promise<void> {
+    if (!this.isConnected(device.id)) return;
+    try {
+      const driver = this.getDriver(device.protocol);
+      if (typeof driver.buildTimeSyncPacket === 'function') {
+        const packets = driver.buildTimeSyncPacket(date);
+        await this.writePackets(device.id, packets);
+        console.log(`[BLE] ⏱️ Synchronized controller time for "${device.name}" (${date.toLocaleTimeString()})`);
+      }
+    } catch (err) {
+      console.warn(`[BLE] Could not sync time for "${device.name}":`, err);
+    }
+  }
+
   /**
    * Connects to the GATT server with a 12s timeout and discovers the optimal writable characteristic.
    */
@@ -318,6 +335,14 @@ export class BleManager {
       this.notifyStatus(deviceId, 'error', err?.message || 'Connection failed');
       throw err;
     }
+
+    // Synchronize physical controller time upon successful GATT connection
+    const driver = this.getDriver(protocol);
+    if (typeof driver.buildTimeSyncPacket === 'function') {
+      const syncPackets = driver.buildTimeSyncPacket(new Date());
+      // Transmit non-blocking so connection finishes promptly
+      this.writePackets(deviceId, syncPackets).catch((e) => console.warn('[BLE] Time sync warning:', e));
+    }
   }
 
     private async connectWeb(device: BluetoothDevice, protocol: ProtocolType): Promise<void> {
@@ -392,7 +417,13 @@ export class BleManager {
         'Primary service discovery timed out after 6s.'
       );
 
+      // Synchronize physical controller time upon successful GATT connection
       const driver = this.getDriver(protocol);
+      if (typeof driver.buildTimeSyncPacket === 'function') {
+        const syncPackets = driver.buildTimeSyncPacket(new Date());
+        // Transmit non-blocking so connection finishes promptly
+        this.writePackets(deviceId, syncPackets).catch((e) => console.warn('[BLE] Time sync warning:', e));
+      }
       let targetChar: BluetoothRemoteGATTCharacteristic | null = null;
       let targetServiceUuid: string | undefined;
 
@@ -489,6 +520,7 @@ export class BleManager {
     if (conn.isNative) return true;
     return !!(conn?.server?.connected && conn.writeCharacteristic);
   }
+
 
   /**
    * Retrieves all devices that have already been granted permission by the user in this browser.

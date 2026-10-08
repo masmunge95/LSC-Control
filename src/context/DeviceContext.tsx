@@ -3,6 +3,7 @@ import type { DeviceRecord, DeviceGroup, ConnectionStatus, RGBColor, ProtocolTyp
 import { StorageDB } from '../storage/db';
 import { BleManager } from '../bluetooth/bleManager';
 import { Capacitor } from '@capacitor/core';
+import { SchedulingEngine } from '../services/schedulingEngine';
 
 interface TargetSelection {
   type: 'all' | 'group' | 'device';
@@ -55,6 +56,7 @@ export const DeviceProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const [selectedTarget, setSelectedTarget] = useState<TargetSelection>({ type: 'all' });
   const ble = BleManager.getInstance();
   const isBluetoothSupported = ble.isSupported();
+  const scheduler = SchedulingEngine.getInstance();
 
   // Load persisted devices and groups from IndexedDB on startup
   useEffect(() => {
@@ -92,41 +94,93 @@ export const DeviceProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       return () => unsubscribe();
     }, []);
 
-    useEffect(() => {
+      // Scheduling Engine Loop: Evaluates schedules & respects manual overrides
+  useEffect(() => {
+    const scheduler = SchedulingEngine.getInstance();
+
     const interval = setInterval(async () => {
       const now = new Date();
       const currentDay = now.getDay();
       const currentHHMM = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
 
-      // Only check once per minute (at second 0-29)
-      if (now.getSeconds() > 30) return;
-
+      // 1. Find enabled schedules matching the current time and day
       const activeSchedules = schedules.filter(
         (s) => s.enabled && s.time === currentHHMM && s.days.includes(currentDay)
       );
 
       for (const sched of activeSchedules) {
-        console.log(`[Scheduler] Firing schedule: ${sched.name} (${sched.action})`);
-                if (sched.targetType === 'all') {
-          for (const dev of devices) {
-            await ble.setPower(dev, sched.action === 'power_on');
-          }
+        // Prevent duplicate execution within the same minute
+        if (scheduler.hasAlreadyFired(sched.id, now)) {
+          continue;
+        }
+
+        // 2. Resolve target devices
+        let allTargetDevs: DeviceRecord[] = [];
+        if (sched.targetType === 'all') {
+          allTargetDevs = devices;
         } else if (sched.targetType === 'group' && sched.targetId) {
           const group = groups.find((g) => g.id === sched.targetId);
           if (group) {
-            const groupDevs = devices.filter((d) => group.deviceIds.includes(d.id));
-            for (const dev of groupDevs) {
-              await ble.setPower(dev, sched.action === 'power_on');
-            }
+            allTargetDevs = devices.filter((d) => group.deviceIds.includes(d.id));
           }
         } else if (sched.targetType === 'device' && sched.targetId) {
-          const dev = devices.find((d) => d.id === sched.targetId);
-          if (dev) {
-            await ble.setPower(dev, sched.action === 'power_on');
+          const single = devices.find((d) => d.id === sched.targetId);
+          if (single) {
+            allTargetDevs = [single];
+          }
+        }
+
+        if (allTargetDevs.length === 0) continue;
+
+        // 3. Apply Manual Override Precedence
+        const { eligible, overridden } = scheduler.filterEligibleDevices(allTargetDevs);
+
+        if (overridden.length > 0) {
+          console.log(
+            `[Scheduler] 🛡️ Manual override active on: ${overridden.map((d) => d.name).join(', ')}. Schedule "${sched.name}" will not overwrite user action.`
+          );
+        }
+
+        // Mark schedule as evaluated for this minute regardless so it doesn't loop
+        scheduler.markFired(sched.id, now);
+
+        if (eligible.length === 0) continue;
+
+        const targetPower = sched.action === 'power_on';
+        console.log(`[Scheduler] ⏰ Executing "${sched.name}" on ${eligible.length} device(s)`);
+
+        // 4. Update React State & IndexedDB for eligible devices
+        const eligibleIds = new Set(eligible.map((d) => d.id));
+        setDevices((prev) =>
+          prev.map((d) => {
+            if (eligibleIds.has(d.id)) {
+              const updated = {
+                ...d,
+                lastKnownState: { ...d.lastKnownState, power: targetPower },
+              };
+              StorageDB.saveDevice(updated);
+              return updated;
+            }
+            return d;
+          })
+        );
+
+        // 5. Transmit BLE commands safely
+        for (const dev of eligible) {
+          try {
+            if (ble.isConnected(dev.id)) {
+              await ble.setPower(dev, targetPower);
+            } else if (Capacitor.isNativePlatform()) {
+              // Attempt quick auto-reconnect on native Android
+              await ble.connect({ id: dev.id, name: dev.name }, dev.protocol);
+              await ble.setPower(dev, targetPower);
+            }
+          } catch (err) {
+            console.warn(`[Scheduler] Could not execute on "${dev.name}":`, err);
           }
         }
       }
-    }, 25000);
+    }, 5000);
 
     return () => clearInterval(interval);
   }, [schedules, devices, groups, ble]);
@@ -237,7 +291,8 @@ export const DeviceProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
       if (ble.isConnected(deviceId)) {
         await ble.setPower(dev, newPower);
-      }
+      };
+      scheduler.recordManualOverride(deviceId);
     },
     [devices, ble]
   );
@@ -262,7 +317,8 @@ export const DeviceProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
       if (ble.isConnected(deviceId)) {
         await ble.setColor(dev, color);
-      }
+      };
+      scheduler.recordManualOverride(deviceId);
     },
     [devices, ble]
   );
@@ -282,7 +338,8 @@ export const DeviceProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
       if (ble.isConnected(deviceId)) {
         await ble.setBrightness(dev, brightness);
-      }
+      };
+      scheduler.recordManualOverride(deviceId);
     },
     [devices, ble]
   );
@@ -302,7 +359,8 @@ export const DeviceProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
       if (ble.isConnected(deviceId)) {
         await ble.setEffect(dev, effectId, speed);
-      }
+      };
+      scheduler.recordManualOverride(deviceId);
     },
     [devices, ble]
   );
