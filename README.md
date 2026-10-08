@@ -64,6 +64,7 @@ Built with **React 19**, **Capacitor 8**, **Tailwind CSS v4**, and native Androi
 
 ## 📂 Project Structure
 
+```text
 lsc-control/ 
 ├── android/ # Native Android studio project (Capacitor) 
 │ └── app/src/main/ 
@@ -88,6 +89,7 @@ lsc-control/
 │ └── types/ # TypeScript interfaces (device, bluetooth, etc.) 
 ├── capacitor.config.ts # Capacitor app configuration 
 └── package.json
+```
 
 
 ---
